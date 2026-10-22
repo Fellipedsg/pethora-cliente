@@ -34,6 +34,13 @@ const ERRORS = {
   LOJA_INDISPONIVEL: 'O agendamento online deste petshop está pausado.',
   PROFISSIONAL_INVALIDO: 'Escolha um profissional válido.',
   SLUG_EM_USO: 'Esse link já está em uso por outro petshop. Tente outro.',
+  RESERVA_EXPIRADA: 'O tempo para pagar o sinal acabou e o horário foi liberado. Faça um novo agendamento.',
+  EMAIL_INVALIDO: 'Digite um e-mail válido para receber o comprovante do Pix.',
+  MP_NAO_CONFIGURADO: 'O pagamento pelo Mercado Pago ainda não foi ativado no PetHora. Fale com o suporte.',
+  MP_NAO_CONECTADO: 'Este petshop ainda não conectou a conta do Mercado Pago.',
+  ESTORNO_FALHOU: 'O Mercado Pago não conseguiu devolver o sinal agora. Tente de novo em alguns minutos.',
+  MP_ERRO: 'O Mercado Pago não respondeu. Tente de novo em instantes.',
+  JA_PAGO: 'Esse sinal já foi pago.',
 };
 function errMsg(e) {
   const m = String((e && (e.code || e.message)) || e || '');
@@ -128,6 +135,17 @@ const T = {
   },
   short(ds) { const [, m, d] = ds.split('-'); return `${d}/${m}`; },
   time: (date, tz) => T.hm(T.parts(date, tz).min),
+};
+
+/* ---------- sinal (Pix) ---------- */
+const DEPOSIT = {
+  active: (shop) => !!(shop && shop.deposit_enabled && shop.mp_connected),
+  amount: (shop, price) => Math.round(Number(price || 0) * (Number(shop.deposit_percent) || 30)) / 100,
+  // reserva aguardando Pix que já venceu conta como cancelada
+  expired: (b) => b.deposit_status === 'pendente' && b.hold_expires_at && new Date(b.hold_expires_at).getTime() < Date.now(),
+  live: (b) => b.status !== 'cancelado' && !DEPOSIT.expired(b),
+  policy: (shop) => `Para garantir o horário, é cobrado um sinal de ${Number(shop.deposit_percent) || 30}% via Pix, descontado do valor no dia. `
+    + `Cancelando com pelo menos ${shop.cancel_hours ?? 24}h de antecedência, o sinal é devolvido. Depois disso, ou se o pet não for levado, o sinal fica com o petshop.`,
 };
 
 /* ---------- regra principal: quais horários estão livres ----------
@@ -241,6 +259,7 @@ function DemoAdapter() {
       id: shopId, owner_id: 'demo', slug: 'patas-e-bolhas', name: 'Patas & Bolhas', tagline: 'Banho e tosa com hora marcada',
       logo_url: '', color: '#1F6F6B', whatsapp: '79999990000', address: 'Rua do Exemplo, 123 · Centro', instagram: 'patasebolhas',
       staff: ['Carla', 'Diego'], slot_interval: 30, min_notice: 60, max_days: 30, timezone: tz, active: true, remind_24h: true, remind_2h: false,
+      deposit_enabled: true, deposit_percent: 30, cancel_hours: 24, mp_connected: true,
       hours: JSON.parse(JSON.stringify(DEFAULT_HOURS)),
     };
     const services = DEFAULT_SERVICES.map((s, i) => ({ id: 'demo-svc-' + (i + 1), shop_id: shopId, active: true, ...JSON.parse(JSON.stringify(s)) }));
@@ -269,7 +288,8 @@ function DemoAdapter() {
         bookings.push({ id: uid(), shop_id: shopId, service_id: svc.id, service_name: svc.name, size, starts_at: start.toISOString(),
           ends_at: new Date(start.getTime() + z.min * 60000).toISOString(), lane, customer_name: cust, customer_phone: phone,
           pet_name: pet, pet_breed: breed, notes: '', price: z.price, status: 'confirmado', source: 'online', created_at: new Date(Date.now() - 3 * 86400000).toISOString(),
-          reminder_24h_at: start.getTime() - Date.now() < 24 * 3600e3 ? new Date().toISOString() : null });
+          reminder_24h_at: start.getTime() - Date.now() < 24 * 3600e3 ? new Date().toISOString() : null,
+          deposit_status: k % 3 === 0 ? 'nenhum' : 'pago', deposit_amount: k % 3 === 0 ? 0 : Math.round(z.price * 30) / 100, pay_token: uid() });
       }
       made++;
     }
@@ -284,7 +304,7 @@ function DemoAdapter() {
     async listServices(shopId) { return delay(db().services.filter((s) => s.shop_id === shopId).sort((a, b) => a.sort - b.sort)); },
     async getBusy(shopId, from, to) {
       const f = new Date(from), t = new Date(to);
-      const out = db().bookings.filter((b) => b.shop_id === shopId && b.status !== 'cancelado' && new Date(b.starts_at) < t && new Date(b.ends_at) > f)
+      const out = db().bookings.filter((b) => b.shop_id === shopId && DEPOSIT.live(b) && new Date(b.starts_at) < t && new Date(b.ends_at) > f)
         .map((b) => ({ starts_at: b.starts_at, ends_at: b.ends_at, lane: b.lane }))
         .concat(db().blocks.filter((k) => k.shop_id === shopId && new Date(k.starts_at) < t && new Date(k.ends_at) > f).map((k) => ({ starts_at: k.starts_at, ends_at: k.ends_at, lane: null })));
       return delay(out);
@@ -293,13 +313,43 @@ function DemoAdapter() {
       const d = db();
       const shop = d.shops.find((s) => s.id === p.shopId);
       const svc = d.services.find((s) => s.id === p.serviceId && s.shop_id === p.shopId);
+      d.bookings.forEach((b) => { if (DEPOSIT.expired(b)) { b.status = 'cancelado'; b.deposit_status = 'expirado'; } });
       const mine = d.bookings.filter((b) => b.shop_id === p.shopId);
       const v = validateBooking(shop, svc, p, mine, d.blocks.filter((k) => k.shop_id === p.shopId), asOwner);
       const row = { id: uid(), shop_id: p.shopId, service_id: svc.id, service_name: svc.name, size: p.size, starts_at: v.start.toISOString(), ends_at: v.end.toISOString(),
         lane: v.lane, customer_name: p.customer.trim(), customer_phone: v.phone, pet_name: p.pet.trim(), pet_breed: (p.breed || '').trim(), notes: (p.notes || '').trim(),
-        price: v.price, status: 'confirmado', source: asOwner ? 'painel' : 'online', created_at: new Date().toISOString() };
+        price: v.price, status: 'confirmado', source: asOwner ? 'painel' : 'online', created_at: new Date().toISOString(),
+        deposit_status: 'nenhum', deposit_amount: 0, pay_token: uid() };
+      if (!asOwner && DEPOSIT.active(shop) && v.price > 0) {
+        row.deposit_status = 'pendente'; row.deposit_amount = DEPOSIT.amount(shop, v.price);
+        row.hold_expires_at = new Date(Date.now() + 30 * 60000).toISOString();
+      }
       d.bookings.push(row); save();
-      return delay({ id: row.id, starts_at: row.starts_at, ends_at: row.ends_at, lane: row.lane, price: row.price });
+      const pend = row.deposit_status === 'pendente';
+      return delay({ id: row.id, starts_at: row.starts_at, ends_at: row.ends_at, lane: row.lane, price: row.price,
+        needs_payment: pend, deposit_amount: row.deposit_amount, hold_expires_at: row.hold_expires_at || null, pay_token: pend ? row.pay_token : null });
+    },
+    // Pix de mentira para a demonstração
+    async pixCreate(id, token) {
+      const b = db().bookings.find((x) => x.id === id && x.pay_token === token);
+      if (!b || DEPOSIT.expired(b)) throw new Error('RESERVA_EXPIRADA');
+      return delay({ demo: true, qr_code: '00020126580014BR.GOV.BCB.PIX0136demonstracao-pethora-pix-copia-e-cola5204000053039865406' + Number(b.deposit_amount).toFixed(2) + '5802BR6304DEMO',
+        qr_code_base64: null, expires_at: b.hold_expires_at, amount: b.deposit_amount });
+    },
+    async bookingStatus(id, token) {
+      const b = db().bookings.find((x) => x.id === id && x.pay_token === token);
+      if (!b) return null;
+      return delay({ status: b.status, deposit_status: DEPOSIT.expired(b) ? 'expirado' : b.deposit_status, hold_expires_at: b.hold_expires_at, deposit_amount: b.deposit_amount });
+    },
+    async demoPay(id) { const b = db().bookings.find((x) => x.id === id); b.deposit_status = 'pago'; b.hold_expires_at = null; save(); return delay(true); },
+    async mpConnectUrl() { db().shops[0].mp_connected = true; save(); return null; },
+    async mpDisconnect() { Object.assign(db().shops[0], { mp_connected: false, deposit_enabled: false }); save(); return delay(true); },
+    async depositAction(id, acao, status) {
+      const b = db().bookings.find((x) => x.id === id);
+      b.status = status;
+      if (b.deposit_status === 'pago') b.deposit_status = acao === 'devolver' ? 'devolvido' : 'retido';
+      else if (b.deposit_status === 'pendente') b.deposit_status = 'expirado';
+      save(); return delay(b);
     },
     // painel
     async session() { return { user: { id: 'demo', email: 'demo@pethora' } }; },
@@ -346,7 +396,20 @@ function SupabaseAdapter(sb) {
         p_pet: p.pet, p_breed: p.breed || '', p_notes: p.notes || '', p_lane: p.lane || null,
       }));
     },
+    async pixCreate(id, token, email) { return fnCall(sb, 'mp-pix', { booking_id: id, token, email }); },
+    async bookingStatus(id, token) { return ok(await sb.rpc('booking_status', { p_id: id, p_token: token })); },
   };
+}
+
+/* chama uma função do servidor e devolve o erro com o código certo */
+async function fnCall(sb, name, body) {
+  const { data, error } = await sb.functions.invoke(name, { body });
+  if (error) {
+    let msg = error.message;
+    try { const j = await error.context.json(); msg = j.error || msg; if (j.detalhe) console.warn(name, j.detalhe); } catch (e) { /* sem corpo */ }
+    throw new Error(msg);
+  }
+  return data;
 }
 
 const toBusy = (rows) => rows.map((r) => ({ start: new Date(r.starts_at), end: new Date(r.ends_at), lane: r.lane == null ? null : Number(r.lane) }));
@@ -515,7 +578,8 @@ async function BookingPage(api, mount, slug) {
     const z = SIZES.find((x) => x.k === S.size);
     return `<dl class="summary"><dt>Serviço</dt><dd>${esc(S.svc.name)}</dd><dt>Porte</dt><dd>${esc(z.k)} · ${esc(z.label)}</dd>
       <dt>Quando</dt><dd>${esc(T.label(S.ds, { weekday: 'short', day: '2-digit', month: '2-digit' }))} às ${T.hm(S.slot)}</dd>
-      <dt>Duração</dt><dd>${dur(sizeInfo().min)}</dd><dt>Valor</dt><dd>${brl(sizeInfo().price)}</dd></dl>`;
+      <dt>Duração</dt><dd>${dur(sizeInfo().min)}</dd><dt>Valor</dt><dd>${brl(sizeInfo().price)}</dd>
+      ${DEPOSIT.active(shop) ? `<dt>Sinal agora</dt><dd>${brl(DEPOSIT.amount(shop, sizeInfo().price))} via Pix</dd>` : ''}</dl>`;
   }
   function renderForm() {
     const el = $('#st-form');
@@ -530,9 +594,12 @@ async function BookingPage(api, mount, slug) {
           <label class="field"><span>Raça <span class="muted">(opcional)</span></span><input class="input" id="f-breed" name="breed" maxlength="60"></label>
           <label class="field" style="grid-column:1/-1"><span>Observações <span class="muted">(opcional)</span></span>
             <textarea class="input" id="f-notes" name="notes" maxlength="500" placeholder="Ex: tem medo de secador, alergia a algum produto, tosa curtinha..."></textarea></label>
-          <button class="btn primary block" id="f-submit" type="submit" style="grid-column:1/-1">Confirmar agendamento</button>
+          ${DEPOSIT.active(shop) ? `<label class="field" style="grid-column:1/-1"><span>E-mail <span class="muted">(para o comprovante do Pix)</span></span><input class="input" id="f-email" type="email" autocomplete="email" maxlength="120"></label>
+          <div class="policy" style="grid-column:1/-1"><p><b>Sinal para garantir o horário</b></p><p>${esc(DEPOSIT.policy(shop))}</p>
+            <label class="switch"><input type="checkbox" id="f-agree"> Li e concordo com a política de sinal e cancelamento</label></div>` : ''}
+          <button class="btn primary block" id="f-submit" type="submit" style="grid-column:1/-1">${DEPOSIT.active(shop) ? 'Reservar e pagar o sinal' : 'Confirmar agendamento'}</button>
         </form>`;
-      try { const saved = JSON.parse(localStorage.getItem('pethora-tutor') || 'null'); if (saved) { $('#f-name').value = saved.name || ''; $('#f-phone').value = saved.phone || ''; $('#f-pet').value = saved.pet || ''; $('#f-breed').value = saved.breed || ''; } } catch (e) { /* sem memória local */ }
+      try { const saved = JSON.parse(localStorage.getItem('pethora-tutor') || 'null'); if (saved) { $('#f-name').value = saved.name || ''; $('#f-phone').value = saved.phone || ''; $('#f-pet').value = saved.pet || ''; $('#f-breed').value = saved.breed || ''; if ($('#f-email')) $('#f-email').value = saved.email || ''; } } catch (e) { /* sem memória local */ }
     }
     $('#bk-sum', el).innerHTML = summaryHtml();
   }
@@ -578,26 +645,91 @@ async function BookingPage(api, mount, slug) {
     if (data.name.length < 2) return toast('Digite seu nome.', 'bad'), $('#f-name').focus();
     if (digits(data.phone).length < 10) return toast('Digite o WhatsApp com DDD.', 'bad'), $('#f-phone').focus();
     if (!data.pet) return toast('Digite o nome do pet.', 'bad'), $('#f-pet').focus();
+    const needDep = DEPOSIT.active(shop);
+    if (needDep) {
+      data.email = v('f-email').trim();
+      if (!/^[^\s@]+@[^\s@]+\.[^\s@]{2,}$/.test(data.email)) return toast(ERRORS.EMAIL_INVALIDO, 'bad'), $('#f-email').focus();
+      if (!$('#f-agree').checked) return toast('Para reservar, marque que concorda com a política de sinal e cancelamento.', 'bad'), $('#f-agree').focus();
+    }
     const btn = $('#f-submit'); btn.disabled = true; btn.textContent = 'Reservando...';
     const start = T.toUtc(S.ds, S.slot, tz);
     try {
       const res = await api.createBooking({ shopId: shop.id, serviceId: S.svc.id, size: S.size, start: start.toISOString(), customer: data.name, phone: data.phone, pet: data.pet, breed: data.breed, notes: data.notes });
-      try { localStorage.setItem('pethora-tutor', JSON.stringify({ name: data.name, phone: data.phone, pet: data.pet, breed: data.breed })); } catch (e) { /* ok */ }
+      try { localStorage.setItem('pethora-tutor', JSON.stringify({ name: data.name, phone: data.phone, pet: data.pet, breed: data.breed, email: data.email || '' })); } catch (e) { /* ok */ }
       clearInterval(S.timer);
-      renderTicket(res, data);
+      if (res.needs_payment) renderPix(res, data); else renderTicket(res, data);
     } catch (e) {
       toast(errMsg(e), 'bad');
-      btn.disabled = false; btn.textContent = 'Confirmar agendamento';
+      btn.disabled = false; btn.textContent = needDep ? 'Reservar e pagar o sinal' : 'Confirmar agendamento';
       if (/HORARIO_INDISPONIVEL|23P01|ANTECEDENCIA|BLOQUEADO/.test(String(e.message))) { S.slot = null; await refreshBusy(false); reveal($('#st-slot')); }
     }
   });
+
+  /* Pix do sinal: QR + copia e cola + contagem; confirma sozinho quando o Mercado Pago avisa */
+  async function renderPix(res, data) {
+    const z = SIZES.find((x) => x.k === S.size);
+    const st = new Date(res.starts_at);
+    const dlabel = T.label(S.ds, { weekday: 'long', day: '2-digit', month: '2-digit' });
+    let stop = false, poll = null, tick = null;
+    const end = () => { stop = true; clearInterval(poll); clearInterval(tick); };
+    main.innerHTML = `${contactHtml(shop)}<section class="card ticket pix" aria-live="polite">
+      <div><p class="eyebrow">Falta só o sinal</p><p class="pet">${esc(data.pet)}</p><p class="when">${esc(dlabel)} às ${T.time(st, tz)}</p></div>
+      <div class="pix-amount"><span>Sinal de ${Number(shop.deposit_percent) || 30}% via Pix</span><b class="num">${brl(res.deposit_amount)}</b>
+        <small>Restante no dia: ${brl(Number(res.price) - Number(res.deposit_amount))}</small></div>
+      <div id="pix-box"><div class="skeleton" style="height:220px"></div></div>
+      <p class="pix-wait" id="pix-wait"><span class="dot"></span> Aguardando o pagamento… o horário fica reservado por <b class="num" id="pix-left">30:00</b></p>
+      <p class="small muted">${esc(DEPOSIT.policy(shop))}</p>
+    </section><p class="foot">Pagamento processado pelo Mercado Pago</p>`;
+    window.scrollTo({ top: 0, behavior: smooth() });
+    const expires = new Date(res.hold_expires_at).getTime();
+    const showExpired = () => {
+      end();
+      main.innerHTML = `${contactHtml(shop)}<section class="card ticket"><p class="eyebrow">Tempo esgotado</p><h2>O horário foi liberado</h2>
+        <p class="muted">O sinal não foi pago em 30 minutos. Se você pagou agora há pouco, o valor volta automaticamente para a sua conta.</p>
+        <button type="button" class="btn primary block" id="again">Escolher outro horário</button></section>`;
+      $('#again').onclick = () => BookingPage(api, mount, slug);
+    };
+    tick = setInterval(() => {
+      const left = Math.max(0, expires - Date.now());
+      const el = $('#pix-left'); if (el) el.textContent = `${String(Math.floor(left / 60000)).padStart(2, '0')}:${String(Math.floor(left / 1000) % 60).padStart(2, '0')}`;
+      if (!left) showExpired();
+    }, 1000);
+    try {
+      const pix = await api.pixCreate(res.id, res.pay_token, data.email);
+      if (stop) return;
+      $('#pix-box').innerHTML = `${pix.qr_code_base64 ? `<img class="pix-qr" alt="QR Code do Pix" src="data:image/png;base64,${esc(pix.qr_code_base64)}">` : `<div class="pix-qr fake">${ICON.paw}<span>QR Code de demonstração</span></div>`}
+        <label class="field"><span>Pix copia e cola</span><textarea class="input num" id="pix-code" readonly rows="3">${esc(pix.qr_code || '')}</textarea></label>
+        <button type="button" class="btn primary block" id="pix-copy">Copiar código Pix</button>
+        ${pix.ticket_url ? `<a class="btn ghost block" href="${esc(pix.ticket_url)}" target="_blank" rel="noopener">Abrir o Pix no Mercado Pago</a>` : ''}
+        ${pix.demo ? '<button type="button" class="btn block" id="pix-demo">Simular pagamento (demonstração)</button>' : ''}`;
+      $('#pix-copy').onclick = async () => {
+        try { await navigator.clipboard.writeText(pix.qr_code); toast('Código copiado! Cole no app do seu banco, na opção Pix copia e cola.'); }
+        catch (e) { const t = $('#pix-code'); t.focus(); t.select(); toast('Selecionei o código: copie e cole no app do banco.'); }
+      };
+      const demo = $('#pix-demo'); if (demo) demo.onclick = () => api.demoPay(res.id);
+    } catch (e) {
+      if (/RESERVA_EXPIRADA/.test(e.message)) return showExpired();
+      $('#pix-box').innerHTML = `<div class="notice">${esc(errMsg(e))}</div><button type="button" class="btn block" id="pix-retry">Tentar de novo</button>`;
+      $('#pix-retry').onclick = () => { end(); renderPix(res, data); };
+      return;
+    }
+    poll = setInterval(async () => {
+      if (stop || document.visibilityState === 'hidden') return;
+      try {
+        const s = await api.bookingStatus(res.id, res.pay_token);
+        if (!s || stop) return;
+        if (s.deposit_status === 'pago') { end(); toast('Pagamento confirmado!'); renderTicket({ ...res, paid: true }, data); }
+        else if (s.deposit_status === 'expirado' || s.status === 'cancelado') showExpired();
+      } catch (e) { /* tenta de novo no próximo ciclo */ }
+    }, 4000);
+  }
 
   function renderTicket(res, data) {
     const z = SIZES.find((x) => x.k === S.size);
     const st = new Date(res.starts_at), en = new Date(res.ends_at);
     const dlabel = T.label(S.ds, { weekday: 'long', day: '2-digit', month: '2-digit' });
     const code = String(res.id).replace(/-/g, '').slice(0, 6).toUpperCase();
-    const msg = `Olá, ${shop.name}! Acabei de agendar pelo site.\n\nPet: ${data.pet}${data.breed ? ' (' + data.breed + ')' : ''} · porte ${z.k}\nServiço: ${S.svc.name}\nDia: ${dlabel} às ${T.time(st, tz)}\nTutor: ${data.name} · ${fmtPhone(data.phone)}\nCódigo: ${code}`;
+    const msg = `Olá, ${shop.name}! Acabei de agendar pelo site${res.paid ? ' e paguei o sinal de ' + brl(res.deposit_amount) + ' pelo Pix' : ''}.\n\nPet: ${data.pet}${data.breed ? ' (' + data.breed + ')' : ''} · porte ${z.k}\nServiço: ${S.svc.name}\nDia: ${dlabel} às ${T.time(st, tz)}\nTutor: ${data.name} · ${fmtPhone(data.phone)}\nCódigo: ${code}`;
     const wa = waLink(shop.whatsapp, msg);
     main.innerHTML = `${contactHtml(shop)}<section class="card ticket" aria-live="polite">
       <div class="check">${ICON.check}</div>
@@ -605,7 +737,8 @@ async function BookingPage(api, mount, slug) {
       <p class="when">${esc(dlabel)}<br>${T.time(st, tz)} às ${T.time(en, tz)}</p>
       <div class="perf"></div>
       <dl class="summary"><dt>Serviço</dt><dd>${esc(S.svc.name)}</dd><dt>Porte</dt><dd>${esc(z.k)} · ${esc(z.label)}</dd>
-        <dt>Valor</dt><dd>${brl(res.price)}</dd><dt>Tutor</dt><dd>${esc(data.name)}</dd><dt>Código</dt><dd>${code}</dd></dl>
+        <dt>Valor</dt><dd>${brl(res.price)}</dd>${res.paid ? `<dt>Sinal pago</dt><dd>${brl(res.deposit_amount)}</dd><dt>Restante no dia</dt><dd>${brl(Number(res.price) - Number(res.deposit_amount))}</dd>` : ''}
+        <dt>Tutor</dt><dd>${esc(data.name)}</dd><dt>Código</dt><dd>${code}</dd></dl>
       ${shop.remind_24h !== false && st.getTime() - Date.now() >= 12 * 3600e3 ? `<p class="small muted">${ICON.wa} Você vai receber um lembrete no WhatsApp <b>${esc(fmtPhone(data.phone))}</b> um dia antes.</p>` : ''}
       ${wa ? `<a class="btn primary block" href="${esc(wa)}" target="_blank" rel="noopener">${ICON.wa} Enviar confirmação no WhatsApp</a>
         <p class="small muted">Se o WhatsApp não abrir, mande uma mensagem para <b class="num">${esc(fmtPhone(shop.whatsapp))}</b> com o código ${code}.</p>` : ''}
