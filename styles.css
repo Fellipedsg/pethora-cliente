@@ -1,7 +1,7 @@
 /* Layout: cliente = coluna de celular com faixa da marca no topo; painel = app com abas.
    A cor da marca (--brand) é definida por petshop via JS. */
 :root {
-  --bg: #F4F6F4;
+  --bg: linear-gradient(135deg, #22c55e, #8b5cf6);
   --surface: #FFFFFF;
   --surface-2: #EDF1EF;
   --ink: #14201D;
